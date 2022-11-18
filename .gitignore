@@ -173,4 +173,5 @@ Temporary Items
 
 main
 _test_param_.txt
-ddd-code-gen/
+gen-output/
+springboot-ddd-gen-mysql

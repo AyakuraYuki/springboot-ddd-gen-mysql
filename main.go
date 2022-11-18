@@ -28,18 +28,13 @@ package main
 import (
 	"flag"
 	"fmt"
-	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-const (
-	sqlShowTableStatus = "SHOW TABLE STATUS LIKE '%s'"
-	sqlShowFullColumns = "SHOW FULL COLUMNS FROM %s"
-)
+const genOutputDir = "gen-output"
 
 var (
 	err        error
@@ -65,112 +60,69 @@ func main() {
 
 	// fetch table info
 	connectToDB()
-	tableStatus, ddlms := readTablePrototype()
+	tableStatus, columns := readTablePrototype()
 
 	// parse class members
-	javaFields := parseJavaFields(ddlms)
+	javaFields := parseJavaFields(columns)
 
 	genPO(tableStatus, javaFields)
 	genMapper(tableStatus)
 	genRepository(tableStatus)
-}
-
-type TableStatus struct {
-	Name      string
-	Rows      uint64
-	Collation string
-	Comment   string
-}
-
-type DDLM struct {
-	Field   string
-	Type    string
-	Null    string
-	Key     string
-	Comment string
-	Default string
-	Extra   string
-}
-
-type JavaField struct {
-	JavaType    string
-	Field       string
-	Comment     string
-	PackageName string
-	IsPri       bool
-}
-
-// parseJavaFields returns Java fields by analysing table info
-func parseJavaFields(ddlms []DDLM) (javaFields []JavaField) {
-	javaFields = make([]JavaField, 0)
-	for _, v := range ddlms {
-		javaType, packageName := getStructType(v)
-		f := JavaField{
-			JavaType:    javaType,
-			Field:       v.Field,
-			Comment:     v.Comment,
-			PackageName: packageName,
-			IsPri:       strings.ToUpper(v.Key) == "PRI",
-		}
-		javaFields = append(javaFields, f)
-	}
-	return
+	genFactory(tableStatus)
+	genEntity(tableStatus, javaFields)
+	genAppService(tableStatus)
+	genAssembler(tableStatus)
 }
 
 func genJavadoc(className string, tableStatus *TableStatus) string {
-	return fmt.Sprintf(`/**
- * %s - %s
+	content := `/**
+ * {{className}} - {{tableComment}}
  *
- * <p>table_name: %s</p>
+ * <p>table_name: {{tableName}}</p>
  *
  * @author ddd-gen-mysql
- * @date %s
- */`, className, tableStatus.Comment, tableStatus.Name, time.Now().String())
+ * @date {{timeString}}
+ */`
+	content = strings.ReplaceAll(content, "{{className}}", className)
+	content = strings.ReplaceAll(content, "{{tableComment}}", tableStatus.Comment)
+	content = strings.ReplaceAll(content, "{{tableName}}", tableStatus.Name)
+	content = strings.ReplaceAll(content, "{{timeString}}", time.Now().String())
+	return content
 }
 
 func genPO(tableStatus *TableStatus, javaFields []JavaField) {
 	entityName := tryRemoveTablePrefix(tableStatus.Name)
 	className := fmt.Sprintf("%sPo", firstUpCase(camelCase(entityName)))
+	importCodes, fieldCodes := parseJavaImportsAndFields(javaFields)
 
-	importCodes, fieldCodes := "", ""
-	for _, v := range javaFields {
-		if v.PackageName != "" && !strings.Contains(importCodes, v.PackageName) {
-			importCodes += fmt.Sprintf("import %s;\n", v.PackageName)
-		}
-		if v.Field == "id" || v.Field == "ctime" || v.Field == "mtime" {
-			continue
-		}
-		fieldCodes += fmt.Sprintf("  private %s %s; // %s\n", v.JavaType, v.Field, v.Comment)
-	}
-	importCodes = strings.TrimSuffix(importCodes, "\n")
-	fieldCodes = strings.TrimSuffix(fieldCodes, "\n")
-	codes := fmt.Sprintf(`package com.mahuafm.phoenix.%s.infrastructure.persistence.po;
+	codes := `package com.mahuafm.phoenix.{{domainName}}.infrastructure.persistence.po;
 
 import com.baomidou.mybatisplus.annotation.TableName;
 import com.mahuafm.phoenix.util.infrastructure.persistence.po.base.BaseAutoIdPo;
-%s
+{{importCodes}}
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 
-%s
+{{javadoc}}
 @Data
 @EqualsAndHashCode(callSuper = true)
-@TableName("%s")
-public class %s extends BaseAutoIdPo {
+@TableName("{{tableName}}")
+public class {{className}} extends BaseAutoIdPo {
 
-%s
+{{fieldCodes}}
 
 }
-`, domainName, importCodes, genJavadoc(className, tableStatus), tableStatus.Name, className, fieldCodes)
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{importCodes}}", importCodes)
+	codes = strings.ReplaceAll(codes, "{{tableName}}", tableStatus.Name)
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
+	codes = strings.ReplaceAll(codes, "{{fieldCodes}}", fieldCodes)
 
-	path := fmt.Sprintf("./%s", filepath.Join("ddd-code-gen", domainName, "infrastructure", "persistence", "po"))
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "infrastructure", "persistence", "po"))
 	filename := fmt.Sprintf("./%s/%s.java", path, className)
-	if _, err = os.Stat(path); os.IsNotExist(err) {
-		if err = os.MkdirAll(path, os.ModePerm); err != nil {
-			panic(err)
-		}
-	}
-	_ = os.WriteFile(filename, []byte(codes), 0666)
+	writeFile(path, filename, codes)
 	fmt.Printf("%s: %s\n", className, filename)
 }
 
@@ -179,23 +131,22 @@ func genMapper(tableStatus *TableStatus) {
 	className := fmt.Sprintf("%sMapper", firstUpCase(camelCase(entityName)))
 	poClassName := fmt.Sprintf("%sPo", firstUpCase(camelCase(entityName)))
 
-	codes := fmt.Sprintf(`package com.mahuafm.phoenix.%s.infrastructure.persistence.mapper;
+	codes := `package com.mahuafm.phoenix.{{domainName}}.infrastructure.persistence.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.mahuafm.phoenix.points.infrastructure.persistence.po.PointsConfigPo;
+import com.mahuafm.phoenix.{{domainName}}.infrastructure.persistence.po.{{poClassName}};
 
-%s
-public interface %s extends BaseMapper<%s> {}
-`, domainName, genJavadoc(className, tableStatus), className, poClassName)
+{{javadoc}}
+public interface {{className}} extends BaseMapper<{{poClassName}}> {}
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{poClassName}}", poClassName)
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
 
-	path := fmt.Sprintf("./%s", filepath.Join("ddd-code-gen", domainName, "infrastructure", "persistence", "mapper"))
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "infrastructure", "persistence", "mapper"))
 	filename := fmt.Sprintf("./%s/%s.java", path, className)
-	if _, err = os.Stat(path); os.IsNotExist(err) {
-		if err = os.MkdirAll(path, os.ModePerm); err != nil {
-			panic(err)
-		}
-	}
-	_ = os.WriteFile(filename, []byte(codes), 0666)
+	writeFile(path, filename, codes)
 	fmt.Printf("%s: %s\n", className, filename)
 }
 
@@ -205,148 +156,185 @@ func genRepository(tableStatus *TableStatus) {
 	mapperClassName := fmt.Sprintf("%sMapper", firstUpCase(camelCase(entityName)))
 	mapperFieldName := fmt.Sprintf("%sMapper", camelCase(entityName))
 
-	codes := fmt.Sprintf(`package com.mahuafm.phoenix.%s.infrastructure.repository;
+	codes := `package com.mahuafm.phoenix.{{domainName}}.infrastructure.repository;
 
-import com.mahuafm.phoenix.%s.infrastructure.persistence.mapper.PointsConfigMapper;
+import com.mahuafm.phoenix.{{domainName}}.infrastructure.persistence.mapper.{{mapperClassName}};
 import javax.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Repository;
 
-%s
+{{javadoc}}
 @Repository
 @Slf4j
-public class %s {
+public class {{className}} {
 
   @Resource
-  private %s %s;
+  private {{mapperClassName}} {{mapperFieldName}};
 
 }
-`, domainName, domainName, genJavadoc(className, tableStatus), className, mapperClassName, mapperFieldName)
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{mapperClassName}}", mapperClassName)
+	codes = strings.ReplaceAll(codes, "{{mapperFieldName}}", mapperFieldName)
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
 
-	path := fmt.Sprintf("./%s", filepath.Join("ddd-code-gen", domainName, "infrastructure", "repository"))
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "infrastructure", "repository"))
 	filename := fmt.Sprintf("./%s/%s.java", path, className)
-	if _, err = os.Stat(path); os.IsNotExist(err) {
-		if err = os.MkdirAll(path, os.ModePerm); err != nil {
-			panic(err)
-		}
-	}
-	_ = os.WriteFile(filename, []byte(codes), 0666)
+	writeFile(path, filename, codes)
 	fmt.Printf("%s: %s\n", className, filename)
 }
 
-// connectToDB inits mDB to connect to the Database.
-func connectToDB() {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", username, password, host, port, schemaName)
-	fmt.Printf("dsn: %s\n\n", dsn)
-	if mDB, err = gorm.Open(mysql.Open(dsn), &gorm.Config{}); err != nil {
-		panic(err)
-	}
+func genFactory(tableStatus *TableStatus) {
+	entityName := tryRemoveTablePrefix(tableStatus.Name)
+	entityClassName := firstUpCase(camelCase(entityName))
+	className := fmt.Sprintf("%sFactory", entityClassName)
+	poClassName := fmt.Sprintf("%sPo", entityClassName)
+
+	codes := `package com.mahuafm.phoenix.{{domainName}}.infrastructure.factory;
+
+import com.mahuafm.phoenix.{{domainName}}.domain.points.entity.{{entityClassName}};
+import com.mahuafm.phoenix.{{domainName}}.infrastructure.persistence.po.{{poClassName}};
+import com.mahuafm.phoenix.util.bean.BeanCopyUtil;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.util.CollectionUtils;
+
+{{javadoc}}
+@Slf4j
+public class {{className}} {
+
+  public static {{entityClassName}} fromPo({{poClassName}} po) {
+    if (po == null) {
+      return null;
+    }
+    var entity = BeanCopyUtil.copy(po, {{entityClassName}}.class);
+    // TODO extra code to invoke setter
+    return entity;
+  }
+
+  public static List<{{entityClassName}}> fromPos(List<{{poClassName}}> pos) {
+    if (CollectionUtils.isEmpty(pos)) {
+      return Collections.emptyList();
+    }
+    return pos.stream()
+        .map({{className}}::fromPo)
+        .filter(Objects::nonNull)
+        .collect(Collectors.toList());
+  }
+
+  public static {{poClassName}} toPo({{entityClassName}} entity) {
+    var po = BeanCopyUtil.copy(entity, PointsConfigPo.class);
+    // TODO extra code to invoke setter
+    return po;
+  }
+
+  public static List<{{poClassName}}> toPos(List<{{entityClassName}}> entities) {
+    if (CollectionUtils.isEmpty(entities)) {
+      return Collections.emptyList();
+    }
+    return entities.stream()
+        .map({{className}}::toPo)
+        .filter(Objects::nonNull)
+        .collect(Collectors.toList());
+  }
+
+}
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{entityClassName}}", entityClassName)
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
+	codes = strings.ReplaceAll(codes, "{{poClassName}}", poClassName)
+
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "infrastructure", "factory"))
+	filename := fmt.Sprintf("./%s/%s.java", path, className)
+	writeFile(path, filename, codes)
+	fmt.Printf("%s: %s\n", className, filename)
 }
 
-// readTablePrototype returns table status and columns by fetching MySQL.
-func readTablePrototype() (*TableStatus, []DDLM) {
-	tableStatus := &TableStatus{}
-	if err = mDB.Raw(fmt.Sprintf(sqlShowTableStatus, tableName)).First(&tableStatus).Error; err != nil {
-		panic(err)
-	}
-	ddlms := make([]DDLM, 0)
-	if err = mDB.Raw(fmt.Sprintf(sqlShowFullColumns, tableName)).Find(&ddlms).Error; err != nil {
-		panic(err)
-	}
-	return tableStatus, ddlms
+func genEntity(tableStatus *TableStatus, javaFields []JavaField) {
+	entityName := tryRemoveTablePrefix(tableStatus.Name)
+	className := firstUpCase(camelCase(entityName))
+	importCodes, fieldCodes := parseJavaImportsAndFields(javaFields)
+
+	codes := `package com.mahuafm.phoenix.{{domainName}}.domain.{{domainName}}.entity;
+
+{{importCodes}}
+import lombok.Data;
+
+{{javadoc}}
+@Data
+public class {{className}} {
+
+{{fieldCodes}}
+
+}
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
+	codes = strings.ReplaceAll(codes, "{{importCodes}}", importCodes)
+	codes = strings.ReplaceAll(codes, "{{fieldCodes}}", fieldCodes)
+
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "domain", domainName, "entity"))
+	filename := fmt.Sprintf("./%s/%s.java", path, className)
+	writeFile(path, filename, codes)
+	fmt.Printf("%s: %s\n", className, filename)
 }
 
-// getStructType returns Java type by DB type
-func getStructType(s DDLM) (string, string) {
-	types := strings.ToLower(s.Type)
-	if strings.Contains(types, "varchar") ||
-		strings.Contains(types, "char") ||
-		strings.Contains(types, "text") ||
-		strings.Contains(types, "json") {
-		return "String", ""
-	}
-	if strings.Contains(types, "bigint") {
-		return "Long", ""
-	}
-	if strings.Contains(types, "tinyint") ||
-		strings.Contains(types, "integer") ||
-		strings.Contains(types, "int") {
-		return "Integer", ""
-	}
-	if strings.Contains(types, "decimal") ||
-		strings.Contains(types, "numeric") ||
-		strings.Contains(types, "double") ||
-		strings.Contains(types, "float") ||
-		strings.Contains(types, "real") {
-		return "BigDecimal", "java.math.BigDecimal"
-	}
-	if strings.Contains(types, "bit") ||
-		strings.Contains(types, "boolean") {
-		return "Boolean", ""
-	}
-	if strings.Contains(types, "binary") {
-		return "byte[]", ""
-	}
-	if strings.Contains(types, "date") ||
-		strings.Contains(types, "time") {
-		return "LocalDateTime", "java.time.LocalDateTime"
-	}
-	return "String", ""
+func genAppService(tableStatus *TableStatus) {
+	entityName := tryRemoveTablePrefix(tableStatus.Name)
+	entityClassName := firstUpCase(camelCase(entityName))
+	className := fmt.Sprintf("%sAppService", entityClassName)
+	repositoryClassName := fmt.Sprintf("%sRepository", entityClassName)
+	repositoryFieldName := fmt.Sprintf("%sRepository", camelCase(entityName))
+
+	codes := `package com.mahuafm.phoenix.{{domainName}}.application.service;
+
+import com.mahuafm.phoenix.{{domainName}}.infrastructure.repository.{{repositoryClassName}};
+import javax.annotation.Resource;
+import org.springframework.stereotype.Service;
+
+{{javadoc}}
+@Service
+public class {{className}} {
+
+  @Resource
+  private {{repositoryClassName}} {{repositoryFieldName}};
+
+}
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
+	codes = strings.ReplaceAll(codes, "{{repositoryClassName}}", repositoryClassName)
+	codes = strings.ReplaceAll(codes, "{{repositoryFieldName}}", repositoryFieldName)
+
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "application", "service"))
+	filename := fmt.Sprintf("./%s/%s.java", path, className)
+	writeFile(path, filename, codes)
+	fmt.Printf("%s: %s\n", className, filename)
 }
 
-// tryRemoveTablePrefix will remove table prefix by the following rules:
-// 1. tb_table -> table;
-// 2. t_table -> table;
-// 3. r_relation -> relation.
-func tryRemoveTablePrefix(s string) string {
-	if len(s) == 0 {
-		return s
-	}
-	if strings.HasPrefix(s, "tb_") {
-		return strings.TrimPrefix(s, "tb_")
-	}
-	if strings.HasPrefix(s, "t_") {
-		return strings.TrimPrefix(s, "t_")
-	}
-	if strings.HasPrefix(s, "r_") {
-		return strings.TrimPrefix(s, "r_")
-	}
-	return s
-}
+func genAssembler(tableStatus *TableStatus) {
+	entityName := tryRemoveTablePrefix(tableStatus.Name)
+	className := fmt.Sprintf("%sAssembler", firstUpCase(camelCase(entityName)))
+	codes := `package com.mahuafm.phoenix.{{domainName}}.application.assembler;
 
-// isASCIILower returns true if character is in ASCII range 'a - z', false if out of this range.
-func isASCIILower(c byte) bool {
-	return 'a' <= c && c <= 'z'
+{{javadoc}}
+public class {{className}} {
 }
+`
+	codes = strings.ReplaceAll(codes, "{{domainName}}", domainName)
+	codes = strings.ReplaceAll(codes, "{{javadoc}}", genJavadoc(className, tableStatus))
+	codes = strings.ReplaceAll(codes, "{{className}}", className)
 
-// camelCase makes underscore string to camel case string.
-func camelCase(s string) string {
-	var b []byte
-	var wasUnderscore bool
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c != '_' {
-			if wasUnderscore && isASCIILower(c) {
-				c -= 'a' - 'A'
-			}
-			b = append(b, c)
-		}
-		wasUnderscore = c == '_'
-	}
-	return string(b)
-}
-
-// firstUpCase makes the first character to upper case.
-func firstUpCase(str string) string {
-	if len(str) == 0 {
-		return str
-	}
-	if !isASCIILower(str[0]) {
-		return str
-	}
-	c := str[0]
-	c -= 'a' - 'A'
-	b := []byte(str)
-	b[0] = c
-	return string(b)
+	path := fmt.Sprintf("%s", filepath.Join(genOutputDir, domainName, "application", "assembler"))
+	filename := fmt.Sprintf("./%s/%s.java", path, className)
+	writeFile(path, filename, codes)
+	fmt.Printf("%s: %s\n", className, filename)
 }
