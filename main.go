@@ -193,7 +193,7 @@ func genFactory(tableStatus *TableStatus) {
 
 	codes := `package com.mahuafm.phoenix.{{domainName}}.infrastructure.factory;
 
-import com.mahuafm.phoenix.{{domainName}}.domain.points.entity.{{entityClassName}};
+import com.mahuafm.phoenix.{{domainName}}.domain.{{domainName}}.entity.{{entityClassName}};
 import com.mahuafm.phoenix.{{domainName}}.infrastructure.persistence.po.{{poClassName}};
 import com.mahuafm.phoenix.util.bean.BeanCopyUtil;
 import java.util.Collections;
@@ -227,7 +227,7 @@ public class {{className}} {
   }
 
   public static {{poClassName}} toPo({{entityClassName}} entity) {
-    var po = BeanCopyUtil.copy(entity, PointsConfigPo.class);
+    var po = BeanCopyUtil.copy(entity, {{poClassName}}.class);
     // TODO extra code to invoke setter
     return po;
   }
