@@ -48,6 +48,8 @@ var (
 	domainName string
 )
 
+var buildVersion string
+
 func main() {
 	flag.StringVar(&username, "u", "root", "用户名")
 	flag.StringVar(&password, "p", "root", "密码")
