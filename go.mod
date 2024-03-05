@@ -1,6 +1,6 @@
 module github.com/AyakuraYuki/springboot-ddd-gen-mysql
 
-go 1.19
+go 1.22
 
 require (
 	gorm.io/driver/mysql v1.4.4
